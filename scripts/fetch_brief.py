@@ -187,25 +187,60 @@ def clean_name(n):
     return n.strip()
 
 
-def fetch_sectors_em(fs, limit=300):
-    """东财板块全量：fs=m:90+t:3 概念 / m:90+t:2 行业。一次请求拿全，本地算排名。"""
-    url = ("https://push2.eastmoney.com/api/qt/clist/get"
-           "?pn=1&pz=%d&po=1&np=1&fltt=2&invt=2&fid=f3"
-           "&fs=%s&fields=f3,f12,f14,f128,f136" % (limit, fs))
-    d = get_json(url, retries=1, timeout=12)
-    items = (((d or {}).get("data") or {}).get("diff")) or []
-    rows = []
-    for x in items:
-        nm = clean_name(x.get("f14", ""))
-        pct = fnum(x.get("f3"), None)
-        if not nm or pct is None:
+def fetch_sectors_em(fs, page_size=100, max_pages=8):
+    """东财板块全量：fs=m:90+t:3 概念 / m:90+t:2 行业。
+
+    注意：东财 clist 接口的 pz 参数会被服务端截到 100，想拿全量必须翻页。
+    若只取第一页，会得到「涨幅前 100 且全为正」的假数据，领跌组和上涨占比全错。
+    """
+    rows, seen = [], set()
+
+    def crawl(po, max_pages=8, page_size=100):
+        """po=1 按涨幅降序，po=0 升序。返回 (行列表, 接口报的总数)。"""
+        got, total = [], 0
+        for pn in range(1, max_pages + 1):
+            url = ("https://push2.eastmoney.com/api/qt/clist/get"
+                   "?pn=%d&pz=%d&po=%d&np=1&fltt=2&invt=2&fid=f3"
+                   "&fs=%s&fields=f3,f12,f14,f128,f136" % (pn, page_size, po, fs))
+            d = get_json(url, retries=1, timeout=12)
+            data = (d or {}).get("data") or {}
+            items = data.get("diff") or []
+            if isinstance(items, dict):
+                items = list(items.values())
+            if not items:
+                break
+            total = int(fnum(data.get("total")) or total or 0)
+            for x in items:
+                nm = clean_name(x.get("f14", ""))
+                pct = fnum(x.get("f3"), None)
+                if not nm or pct is None:
+                    continue
+                got.append({
+                    "name": nm, "pct": pct,
+                    "leader": (x.get("f128") or "").strip(),
+                    "leader_pct": fnum(x.get("f136")),
+                })
+            if len(items) < page_size or (total and len(got) >= total):
+                break
+            time.sleep(0.35)
+        return got, total
+
+    rows, total = crawl(1)
+
+    # 自检：若全部为正，说明列表被截断（只拿到涨幅榜前排），
+    # 反向再抓一次补齐真实的下跌板块，否则「领跌组」会是正数。
+    if rows and total and len(rows) < total * 0.9 and all(r["pct"] > 0 for r in rows):
+        tail, _ = crawl(0, max_pages=3)
+        print(f"[WARN] 板块降序仅取到 {len(rows)}/{total}，反向补抓 {len(tail)} 条")
+        rows.extend(tail)
+
+    out, dedup = [], set()
+    for r in rows:
+        if r["name"] in dedup:
             continue
-        rows.append({
-            "name": nm, "pct": pct,
-            "leader": (x.get("f128") or "").strip(),
-            "leader_pct": fnum(x.get("f136")),
-        })
-    return rows
+        dedup.add(r["name"])
+        out.append(r)
+    return out
 
 
 def fetch_sectors_sina(param="industry"):
@@ -252,7 +287,10 @@ def pack_sectors(rows, source, top_n=6, bottom_n=6):
     down = [r for r in rows if r["pct"] < 0]
     rows.sort(key=lambda x: -x["pct"])
     top = rows[:top_n]
-    bottom = sorted(rows[-bottom_n:], key=lambda x: x["pct"])
+    # 领跌组只放真正的下跌板块；一条都没有就留空，绝不用正数板块冒充
+    bottom = sorted(down, key=lambda x: x["pct"])[:bottom_n] if down else []
+    if not down and len(rows) >= 30:
+        print(f"[WARN] 板块 {len(rows)} 个全部为涨，疑似列表被截断，领跌组留空")
     return {
         "source": source,
         "total": len(rows),
@@ -505,6 +543,12 @@ def pick_news(feed, limit=3, focus_themes=None):
         body = re.sub(r"^【[^】]*】", "", c["body"] or "").strip()
         body = re.sub(r"\s+", " ", body)
         body = strip_title_prefix(c["title"], body)
+        # 新浪的列表标题有时被截在半句，正文又从同一句续上，
+        # 会把「请应急 / 请应急管理部…」这种残句留在标题里。去掉这段重叠。
+        for k in range(min(len(c["title"]), 24), 2, -1):
+            if body.startswith(c["title"][-k:]):
+                c["title"] = c["title"][:-k].rstrip("，,、；;：: ")
+                break
         if not body or len(body) < 20:
             body = c["title"]
         body = re.sub(r"[，,、；;：:]+$", "", body)
