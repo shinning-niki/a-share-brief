@@ -194,20 +194,26 @@ def fetch_sectors_em(fs, page_size=100, max_pages=8):
     若只取第一页，会得到「涨幅前 100 且全为正」的假数据，领跌组和上涨占比全错。
     """
     rows, seen = [], set()
+    holes = []
 
-    def crawl(po, max_pages=8, page_size=100):
+    def crawl(po, max_pages=8, page_size=100, gap=1.6):
         """po=1 按涨幅降序，po=0 升序。返回 (行列表, 接口报的总数)。"""
         got, total = [], 0
         for pn in range(1, max_pages + 1):
             url = ("https://push2.eastmoney.com/api/qt/clist/get"
                    "?pn=%d&pz=%d&po=%d&np=1&fltt=2&invt=2&fid=f3"
                    "&fs=%s&fields=f3,f12,f14,f128,f136" % (pn, page_size, po, fs))
-            d = get_json(url, retries=1, timeout=12)
+            d = get_json(url, retries=2, delay=3, timeout=15)
             data = (d or {}).get("data") or {}
             items = data.get("diff") or []
             if isinstance(items, dict):
                 items = list(items.values())
             if not items:
+                # 单页被限流不应让整轮中断，记下缺口继续翻下一页
+                holes.append((po, pn))
+                if pn >= 2:
+                    time.sleep(gap * 2)
+                    continue
                 break
             total = int(fnum(data.get("total")) or total or 0)
             for x in items:
@@ -222,17 +228,19 @@ def fetch_sectors_em(fs, page_size=100, max_pages=8):
                 })
             if len(items) < page_size or (total and len(got) >= total):
                 break
-            time.sleep(0.35)
+            time.sleep(gap)
         return got, total
 
     rows, total = crawl(1)
 
-    # 自检：若全部为正，说明列表被截断（只拿到涨幅榜前排），
-    # 反向再抓一次补齐真实的下跌板块，否则「领跌组」会是正数。
-    if rows and total and len(rows) < total * 0.9 and all(r["pct"] > 0 for r in rows):
-        tail, _ = crawl(0, max_pages=3)
-        print(f"[WARN] 板块降序仅取到 {len(rows)}/{total}，反向补抓 {len(tail)} 条")
+    # 自检：若全部为正，说明列表只覆盖了涨幅榜前排，
+    # 反向再抓一次补齐真实的下跌板块，否则「领跌组」会显示正数。
+    if rows and all(r["pct"] > 0 for r in rows):
+        tail, _ = crawl(0, max_pages=2)
+        print(f"[WARN] 板块降序覆盖 {len(rows)}/{total or '?'}，反向补抓 {len(tail)} 条")
         rows.extend(tail)
+    if holes:
+        print(f"[WARN] 有 {len(holes)} 页未取到：{holes[:5]}")
 
     out, dedup = [], set()
     for r in rows:
@@ -240,7 +248,7 @@ def fetch_sectors_em(fs, page_size=100, max_pages=8):
             continue
         dedup.add(r["name"])
         out.append(r)
-    return out
+    return out, total
 
 
 def fetch_sectors_sina(param="industry"):
@@ -303,12 +311,23 @@ def pack_sectors(rows, source, top_n=6, bottom_n=6):
 
 
 def fetch_sectors():
-    """优先级：东财概念 → 东财行业 → 新浪行业 → 新浪概念"""
+    """优先级：东财概念 → 东财行业 → 新浪行业 → 新浪概念。
+
+    选源门槛：数据必须「基本完整」且「能抓到下跌板块」，否则整块降级。
+    半个榜单比没有榜单更危险——领跌组会用正数板块冒充，上涨占比也会失真。
+    """
     for fs, src in (("m:90+t:3", "em_concept"), ("m:90+t:2", "em_industry")):
-        rows = fetch_sectors_em(fs)
-        if len(rows) >= 20:
-            print(f"[INFO] 板块来源 {src}，{len(rows)} 个")
-            return pack_sectors(rows, src)
+        rows, total = fetch_sectors_em(fs)
+        if len(rows) < 20:
+            continue
+        covered = (len(rows) / total) if total else 1.0
+        has_down = any(r["pct"] < 0 for r in rows)
+        if covered < 0.85 or not has_down:
+            print(f"[WARN] {src} 数据不完整（{len(rows)}/{total or '?'}，"
+                  f"含下跌 {has_down}），降级到下一个源")
+            continue
+        print(f"[INFO] 板块来源 {src}，{len(rows)} 个")
+        return pack_sectors(rows, src)
     for param, src in (("industry", "sina_industry"), ("class", "sina_concept")):
         rows = fetch_sectors_sina(param)
         if len(rows) >= 20:
