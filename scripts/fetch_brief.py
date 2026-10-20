@@ -310,21 +310,78 @@ def pack_sectors(rows, source, top_n=6, bottom_n=6):
     }
 
 
-def fetch_sectors():
-    """优先级：东财概念 → 东财行业 → 新浪行业 → 新浪概念。
+def _em_page(fs, po, pz=100, pn=1):
+    """取东财某板块集合的单页。po=1 降序（涨幅榜），po=0 升序（跌幅榜）。
+    返回 None 表示这次请求失败（区别于「成功但没有数据」）。"""
+    url = ("https://push2.eastmoney.com/api/qt/clist/get"
+           "?pn=%d&pz=%d&po=%d&np=1&fltt=2&invt=2&fid=f3"
+           "&fs=%s&fields=f3,f12,f14,f128,f136" % (pn, pz, po, fs))
+    d = get_json(url, retries=2, delay=3, timeout=15)
+    if d is None:
+        return None
+    data = (d or {}).get("data") or {}
+    items = data.get("diff") or []
+    if isinstance(items, dict):
+        items = list(items.values())
+    rows = []
+    for x in items:
+        nm = clean_name(x.get("f14", ""))
+        pct = fnum(x.get("f3"), None)
+        if not nm or pct is None:
+            continue
+        rows.append({
+            "name": nm, "pct": pct,
+            "leader": (x.get("f128") or "").strip(),
+            "leader_pct": fnum(x.get("f136")),
+        })
+    return rows
 
-    选源门槛：数据必须「基本完整」且「能抓到下跌板块」，否则整块降级。
-    半个榜单比没有榜单更危险——领跌组会用正数板块冒充，上涨占比也会失真。
+
+def fetch_sectors_concept():
+    """概念主题：只在涨幅榜和跌幅榜各取一页，不做全量翻页。
+
+    东财对云端 IP 只放行前 300 行（pn>3 直接返回空），全量 500+ 概念拿不到；
+    但「领涨主题 + 领跌主题」只需要两端各一页，这样拿到的数据是真实且完整的。
+    因此这里不提供全市场涨跌家数，页面上也不显示板块涨跌比例。
     """
-    for fs, src in (("m:90+t:3", "em_concept"), ("m:90+t:2", "em_industry")):
+    top = _em_page("m:90+t:3", 1)
+    if not top:
+        return None
+    time.sleep(1.2)
+    bot = _em_page("m:90+t:3", 0)
+    if bot is None:
+        return None
+    bot = [r for r in bot if r["pct"] < 0]
+    if len(top) < 10:
+        return None
+    packed = pack_sectors(top + bot, "em_concept")
+    if packed:
+        packed["total"] = 0        # 未掌握全量，页面据此不画涨跌比例条
+        packed["up_count"] = 0
+        packed["down_count"] = len(bot)
+    return packed
+
+
+def fetch_sectors():
+    """优先级：东财概念（两端各一页）→ 东财行业（可全量）→ 新浪行业。
+
+    任何一档拿到的数据如果「只有涨的、没有跌的」，就整块降级，
+    绝不让正数板块冒充「领跌」。
+    """
+    packed = fetch_sectors_concept()
+    if packed and packed.get("bottom"):
+        print(f"[INFO] 板块来源 em_concept，涨 {len(packed['top'])} 跌 {len(packed['bottom'])}")
+        return packed
+    print("[WARN] 概念板块两端未取全，降级到行业板块")
+
+    for fs, src in (("m:90+t:2", "em_industry"),):
         rows, total = fetch_sectors_em(fs)
         if len(rows) < 20:
             continue
         covered = (len(rows) / total) if total else 1.0
         has_down = any(r["pct"] < 0 for r in rows)
         if covered < 0.85 or not has_down:
-            print(f"[WARN] {src} 数据不完整（{len(rows)}/{total or '?'}，"
-                  f"含下跌 {has_down}），降级到下一个源")
+            print(f"[WARN] {src} 数据不完整（{len(rows)}/{total or '?'}），继续降级")
             continue
         print(f"[INFO] 板块来源 {src}，{len(rows)} 个")
         return pack_sectors(rows, src)
