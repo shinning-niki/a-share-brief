@@ -121,6 +121,14 @@ def sectors_block(b):
       <span class="down">下跌 {dn_n}</span>
     </div>"""
 
+    down_grp = ""
+    if bottom:
+        down_grp = f"""
+    <div class="grp">
+      <div class="grp-title down">下跌主题</div>
+      {sector_rows(bottom, max_abs, 'down')}
+    </div>"""
+
     return f"""
   <section class="block">
     <h2>板块强弱<span class="h2-sub">{esc(SRC_LABEL.get(sec.get('source'), '板块'))}</span></h2>
@@ -128,11 +136,7 @@ def sectors_block(b):
     <div class="grp">
       <div class="grp-title up">上涨主题</div>
       {sector_rows(top, max_abs, 'up')}
-    </div>
-    <div class="grp">
-      <div class="grp-title down">下跌主题</div>
-      {sector_rows(bottom, max_abs, 'down')}
-    </div>
+    </div>{down_grp}
   </section>"""
 
 
