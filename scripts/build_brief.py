@@ -106,10 +106,12 @@ def sectors_block(b):
     up_n = sec.get("up_count") or 0
     dn_n = sec.get("down_count") or 0
     max_abs = sec.get("max_abs") or 1
-    up_ratio = (up_n / total * 100) if total else 50
 
+    # 涨跌比例条只在掌握全量板块时显示（行业源）；
+    # 概念源只取涨幅榜与跌幅榜两端，给不出全量家数，宁可不画也不画错。
     breadth = ""
-    if total:
+    if total >= 30:
+        up_ratio = (up_n / total * 100) if total else 50
         breadth = f"""
     <div class="breadth">
       <div class="b-up" style="width:{up_ratio:.1f}%"></div>
