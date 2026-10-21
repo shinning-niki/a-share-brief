@@ -2,15 +2,19 @@ name: A股收盘简报
 
 on:
   schedule:
-    # GitHub Actions 使用 UTC。北京时间 = UTC+8
+    # GitHub Actions 使用 UTC，北京时间 = UTC+8。
     # GitHub 原生 cron 是 best-effort：高峰期会延迟甚至静默丢弃，
-    # 因此设置三个冗余触发点，靠脚本内的「当日已完成」闸门去重。
+    # 因此设置 5 个冗余触发点，靠「当日已完成」闸门去重，绝不会重复推送。
     #   07:20 UTC = 北京 15:20  主触发
-    #   07:45 UTC = 北京 15:45  备用
-    #   08:10 UTC = 北京 16:10  末次兜底
+    #   07:45 UTC = 北京 15:45  备用一
+    #   08:15 UTC = 北京 16:15  备用二
+    #   08:50 UTC = 北京 16:50  备用三
+    #   09:30 UTC = 北京 17:30  末次兜底
     - cron: '20 7 * * 1-5'
     - cron: '45 7 * * 1-5'
-    - cron: '10 8 * * 1-5'
+    - cron: '15 8 * * 1-5'
+    - cron: '50 8 * * 1-5'
+    - cron: '30 9 * * 1-5'
   workflow_dispatch:
     inputs:
       force:
@@ -47,8 +51,9 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 去重闸门：history.json 中已存在今日日期 = 今天已完整跑完并推送成功。
-      # 三个 cron 触发点中，第一个跑成功后续自动跳过，不会重复推送。
+      # ---------------------------------------------------------------- 去重闸门
+      # history.json 含今日日期 = 今天已成功推送。5 个触发点中第一个成功后，
+      # 其余全部在这里退出，不会重复抓数、不会重复推送。
       - name: 去重闸门（当日是否已完成）
         id: gate
         env:
@@ -68,6 +73,9 @@ jobs:
             echo "::notice title=执行::今日尚未完成，继续抓取与推送"
           fi
 
+      # ---------------------------------------------------------------- 取数与渲染
+      # 行情源全挂时 fetch_brief.py 会抛错而不是伪装成「休市」，
+      # 保证失败可见、可告警、可在下一个触发点重试。
       - name: 抓取收盘数据
         id: fetch
         if: steps.gate.outputs.skip != 'true'
@@ -84,12 +92,19 @@ jobs:
         if: steps.fetch.outputs.trading == 'True'
         run: python scripts/build_brief.py
 
+      # ---------------------------------------------------------------- 发布页面
+      # Pages 是次要目标：三步全部 continue-on-error，任何一步失败都不许
+      # 阻塞手机推送。页面失败只影响链接内容，不影响送达。
       - name: 配置 Pages
+        id: pages_cfg
         if: steps.fetch.outputs.trading == 'True'
+        continue-on-error: true
         uses: actions/configure-pages@v5
 
       - name: 上传页面
+        id: pages_up
         if: steps.fetch.outputs.trading == 'True'
+        continue-on-error: true
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
@@ -97,9 +112,12 @@ jobs:
       - name: 部署到 GitHub Pages
         id: deploy
         if: steps.fetch.outputs.trading == 'True'
+        continue-on-error: true
         uses: actions/deploy-pages@v4
 
+      # ---------------------------------------------------------------- 主目标：送达
       - name: 推送到手机
+        id: notify
         if: steps.fetch.outputs.trading == 'True'
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
@@ -110,9 +128,10 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python scripts/notify.py
 
-      # 放在推送成功之后：只有完整跑完才写今日标记。
-      # 中途失败时标记不存在，下一个 cron 触发点会自动重试。
+      # 只有推送成功才会走到这里。标记写入 history.json 并提交，
+      # 后续触发点据此跳过；若本步失败，标记不落库，下个触发点自动重试。
       - name: 标记本日已完成
+        id: mark
         if: steps.fetch.outputs.trading == 'True'
         run: |
           git config user.name "github-actions[bot]"
@@ -121,14 +140,33 @@ jobs:
           git diff --quiet --cached || git commit -m "chore: 更新成交额历史 $(date +%Y-%m-%d) [skip ci]"
           git push || echo "::warning::历史文件推送失败，不影响本次简报"
 
+      # ---------------------------------------------------------------- 异常告警
+      - name: 失败告警
+        if: failure()
+        env:
+          BARK_URL: ${{ secrets.BARK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          STEP="未知环节"
+          if [ "${{ steps.fetch.outcome }}" = "failure" ]; then STEP="抓取收盘数据"; fi
+          if [ "${{ steps.notify.outcome }}" = "failure" ]; then STEP="推送到手机"; fi
+          if [ "${{ steps.mark.outcome }}" = "failure" ]; then STEP="标记本日已完成"; fi
+          python scripts/alert.py \
+            "A股简报执行失败" \
+            "失败环节：$STEP｜触发：${{ github.event_name }}｜下一个时间点会自动重试"
+
       - name: 运行摘要
         if: always()
         run: |
           echo "## A股收盘简报运行记录" >> $GITHUB_STEP_SUMMARY
-          echo "- 触发方式：${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- 去重闸门：skip=${{ steps.gate.outputs.skip }}" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 结果 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 触发方式 | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 去重闸门 | skip=${{ steps.gate.outputs.skip }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 交易日 | ${{ steps.fetch.outputs.trading }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 页面部署 | ${{ steps.deploy.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 手机推送 | ${{ steps.notify.outcome }} |" >> $GITHUB_STEP_SUMMARY
           if [ -f data/summary.md ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
             cat data/summary.md >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- 未生成运行摘要（抓取阶段可能异常或被跳过）" >> $GITHUB_STEP_SUMMARY
           fi
