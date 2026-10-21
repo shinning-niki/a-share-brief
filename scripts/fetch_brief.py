@@ -291,11 +291,31 @@ NOISE_SECTOR = {
     "金融地产风格", "成长风格", "价值风格", "大盘风格", "小盘风格",
 }
 
+# 东财的板块名会带后缀/组合变体（如「昨日涨停_含一字」「昨日首板」），
+# 精确匹配会漏网，因此再叠一层特征词判定：名字里出现这些特征即视为统计型伪板块。
+NOISE_PAT = re.compile(
+    r"昨日|首板|连板|触板|涨停|跌停|上榜|含一字|含GDR|含B股|含H股|"
+    r"次新|新股|ST|题材股|概念股|成分股|反转股|"
+    r"历史新高|历史新低|新高|新低|破净|高送转|举牌|参股|"
+    r"预盈|预亏|业绩预|扭亏|"
+    r"融资融券|转融券|深股通|沪股通|MSCI|富时|标普|"
+    r"重仓|增持|回购|减持|股权转让|"
+    r"微盘|低价股|高价股|百元股|"
+    r"风格|大盘股|中盘股|小盘股|红利|市盈率|市净率"
+)
+
+
+def is_noise_sector(name):
+    """是不是统计型/风格型伪板块（不是真实产业主题）。"""
+    if not name:
+        return True
+    return name in NOISE_SECTOR or bool(NOISE_PAT.search(name))
+
 
 def pack_sectors(rows, source, top_n=6, bottom_n=6):
     if not rows:
         return None
-    rows = [r for r in rows if r["name"] and r["name"] not in NOISE_SECTOR]
+    rows = [r for r in rows if not is_noise_sector(r.get("name"))]
     if not rows:
         return None
     up = [r for r in rows if r["pct"] > 0]
@@ -771,16 +791,32 @@ def match_catalyst(up_themes, sectors, news):
     return None
 
 
-STOCK_RE = re.compile(r"([\u4e00-\u9fa5A-Za-z]{2,5}(?:、[\u4e00-\u9fa5A-Za-z]{2,5}){0,3})等?[^。]{0,12}?涨停")
+STOCK_RE = re.compile(
+    r"([\u4e00-\u9fa5A-Za-z]{2,4}(?:、[\u4e00-\u9fa5A-Za-z]{2,4}){0,3})"
+    r"(?:等)?[^。，、；\s]{0,10}?(?:涨停|封板)"
+)
+
+# A股股票简称基本不超过 4 个字；收评原文里紧邻「涨停」的常是「券商板块高开」「猪肉板块表现」
+# 这类描述片段，必须先按特征词剔除，否则会把板块描述当成个股名写进归因文案。
+STOCK_STOP = (
+    "板块", "概念", "指数", "题材", "行业", "市场", "资金", "权重", "龙头", "个股", "全线",
+    "集体", "多数", "盘中", "午后", "早盘", "尾盘", "收盘", "开盘", "成交", "上涨", "下跌",
+    "涨超", "跌超", "拉升", "走强", "走弱", "高开", "低开", "翻红", "翻绿", "表现", "活跃",
+    "资金流", "方向", "主线", "格局", "行情", "两市", "沪指", "深指", "创业", "科创", "北证",
+)
 
 
 def notable_stocks(wrap_text):
-    """从收评正文里提取涨停个股名，最多 3 只。"""
+    """从收评正文里提取涨停个股简称，最多 3 只。拿不准就返回空，不硬凑。"""
     out = []
     for m in STOCK_RE.finditer(wrap_text or ""):
         for name in m.group(1).split("、"):
-            name = name.strip()
-            if 2 <= len(name) <= 5 and name not in out:
+            name = name.strip().rstrip("等")
+            if not (2 <= len(name) <= 4):
+                continue
+            if any(w in name for w in STOCK_STOP):
+                continue
+            if name not in out:
                 out.append(name)
         if len(out) >= 3:
             break
@@ -849,8 +885,10 @@ def build_attribution(d, feed=None):
         blocks.append({"k": "量能", "t": judge + "。"})
 
     # 3) 主线：钱在往哪走
-    up_themes = wrap.get("up_themes") or [x["name"] for x in (sec.get("top") or [])[:3]]
-    down_themes = wrap.get("down_themes") or [x["name"] for x in (sec.get("bottom") or [])[:3]]
+    def _clean(themes):
+        return [t for t in (themes or []) if t and not is_noise_sector(t)]
+    up_themes = _clean(wrap.get("up_themes")) or [x["name"] for x in (sec.get("top") or [])[:3]]
+    down_themes = _clean(wrap.get("down_themes")) or [x["name"] for x in (sec.get("bottom") or [])[:3]]
     if up_themes or down_themes:
         seg = ""
         if up_themes:
