@@ -67,7 +67,6 @@ jobs:
           else
             echo "::notice title=执行::今日尚未完成，继续抓取与推送"
           fi
-          fi
 
       - name: 抓取收盘数据
         id: fetch
