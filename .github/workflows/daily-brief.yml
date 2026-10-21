@@ -51,26 +51,22 @@ jobs:
       # 三个 cron 触发点中，第一个跑成功后续自动跳过，不会重复推送。
       - name: 去重闸门（当日是否已完成）
         id: gate
+        env:
+          FORCE_INPUT: ${{ github.event.inputs.force }}
         run: |
-          TODAY=$(TZ=Asia/Shanghai date +%F)
-          FORCE="${{ github.event.inputs.force }}"
-          if [ "$FORCE" = "true" ]; then
-            echo "skip=false" >> $GITHUB_OUTPUT
-            echo "::notice title=强制重跑::force=true，忽略当日已完成检查"
-            exit 0
+          ARG=""
+          if [ "$FORCE_INPUT" = "true" ]; then
+            ARG="--force"
           fi
-          DONE=$(TZ=Asia/Shanghai TODAY="$TODAY" python -c "
-import json, os
-p = 'data/history.json'
-today = os.environ['TODAY']
-print('yes' if os.path.exists(p) and today in json.load(open(p)) else 'no')
-")
-          if [ "$DONE" = "yes" ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "::notice title=已推送::今日($TODAY)简报已完成，本次触发跳过"
+          OUT=$(python scripts/check_done.py $ARG)
+          echo "$OUT"
+          SKIP=$(echo "$OUT" | grep '^skip=' | cut -d= -f2)
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP" = "true" ]; then
+            echo "::notice title=已推送::今日简报已完成，本次触发跳过"
           else
-            echo "skip=false" >> $GITHUB_OUTPUT
-            echo "今日($TODAY)尚未完成，继续执行"
+            echo "::notice title=执行::今日尚未完成，继续抓取与推送"
+          fi
           fi
 
       - name: 抓取收盘数据
