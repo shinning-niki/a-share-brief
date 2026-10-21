@@ -136,16 +136,25 @@ def fetch_quotes_tencent():
 
 def fetch_quotes_em():
     ids = ",".join(x[2] for x in TX_INDEX)
+    # f124 = 行情更新时间戳。没有它就无法判断这批数据属于哪一天，
+    # 节假日东财照样返回上一交易日的指数，会被误当成「今天是交易日」。
     d = get_json("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids="
-                 + ids + "&fields=f2,f3,f4,f6,f12,f13,f14", retries=1, timeout=12)
+                 + ids + "&fields=f2,f3,f4,f6,f12,f13,f14,f124", retries=1, timeout=12)
     out = {}
     for item in (((d or {}).get("data") or {}).get("diff")) or []:
         name = item.get("f14", "")
         if name:
+            ts = item.get("f124")
+            tstr = ""
+            try:
+                if ts:
+                    tstr = datetime.fromtimestamp(int(ts), CN_TZ).strftime("%Y%m%d%H%M%S")
+            except (TypeError, ValueError, OSError):
+                tstr = ""
             out[name] = {
                 "name": name, "close": fnum(item.get("f2")),
                 "pct": fnum(item.get("f3")), "chg": fnum(item.get("f4")),
-                "amount": fnum(item.get("f6")),
+                "amount": fnum(item.get("f6")), "time": tstr,
             }
     return out
 
@@ -979,12 +988,22 @@ def main():
         trade_time = list(indices.values())[0].get("time", "")
     is_trading = trade_time.startswith(today_compact)
 
-    if not is_trading and not indices:
+    if not indices:
         indices = fetch_quotes_em()
-        is_trading = bool(indices)
+        if indices:
+            trade_time = list(indices.values())[0].get("time", "") or trade_time
+            is_trading = trade_time.startswith(today_compact)
+
+    # 数据源全挂时绝不能被当成「休市」静默跳过 —— 那会让用户在交易日
+    # 完全收不到简报，而且没有任何告警。必须显式失败，让工作流变红并触发告警。
+    if not indices:
+        raise RuntimeError("行情数据全部获取失败（腾讯 + 东财均无返回），无法判定交易日")
+
+    if not trade_time:
+        raise RuntimeError(f"已获取 {len(indices)} 个指数但缺少行情时间戳，无法确认是否为今日行情")
 
     if not is_trading:
-        brief["reason"] = f"今日休市（最近行情时间 {trade_time or '未知'}）"
+        brief["reason"] = f"今日休市（最近行情时间 {trade_time}）"
         print(f"[INFO] {brief['reason']}")
     else:
         brief["is_trading_day"] = True
