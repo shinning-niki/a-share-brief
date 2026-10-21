@@ -84,7 +84,9 @@ def sector_rows(rows, max_abs, kind):
         pct = r.get("pct", 0)
         w = max(min(abs(pct) / (max_abs or 1) * 100, 100), 3)
         leader = ""
-        if r.get("leader"):
+        # 数据源只给「板块内领涨股」，没有领跌股。在下跌组里挂一只红盘个股
+        # 会造成「绿板块配红个股」的读图冲突，因此下跌组不展示个股。
+        if kind == "up" and r.get("leader"):
             leader = f'<span class="leader">{esc(r["leader"])} {pct_text(r.get("leader_pct", 0))}</span>'
         out.append(f"""
       <div class="srow">
