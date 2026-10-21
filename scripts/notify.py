@@ -170,9 +170,12 @@ def main():
                                                os.environ["TG_CHAT_ID"], b, page)))
 
     if not channels:
-        print("[WARN] 未配置任何推送渠道，仅生成页面。")
-        print("       请至少配置 FEISHU_WEBHOOK / BARK_URL / SCT_KEY / PUSHPLUS_TOKEN 之一。")
-        return 0
+        # 推送是本任务的主目标。没有渠道等于什么都没送出去，
+        # 静默返回 0 会让工作流显示成功、用户却收不到 —— 必须显式失败。
+        print("[ERR] 未配置任何推送渠道，本次未送达任何设备", file=sys.stderr)
+        print("       请在仓库 Secrets 中至少配置 BARK_URL / FEISHU_WEBHOOK / "
+              "SCT_KEY / PUSHPLUS_TOKEN 之一。", file=sys.stderr)
+        return 1
 
     for name, fn in channels:
         try:
