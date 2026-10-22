@@ -1,53 +1,85 @@
 name: A股收盘简报
 
 # ============================================================================
-# 触发层设计（2026-10-22 重构）
+# 调度设计：为什么是「提前排队 + 睡到收盘」，而不是直接把 cron 设在 15:20
 #
-# 背景：GitHub 原生 schedule 实测严重不可靠——2026-10-21 两次定时触发迟到约
-# 7 小时（北京 22:10 / 22:35），2026-10-22 主触发点完全未触发。仅靠 cron
-# 无法保证「每个交易日 15:20 送达」。
+# 事实基础（本仓库 + trend-dashboard + us-share-brief 的完整调度历史）：
+#   GitHub Actions 原生 cron 是 best-effort，实测延迟 0.5 ~ 5.5 小时，
+#   偶尔直接丢弃不跑，且失败完全静默。没有任何 UTC 时段是可靠的。
 #
-# 因此改为多源触发，三路并行，靠「当日已完成」闸门保证只推一次：
-#   L1  repository_dispatch —— 外部定时器入口（最可靠，准点）
-#   L2  schedule            —— GitHub self-hosted cron，密集冗余，能跑则跑
-#   L3  workflow_dispatch   —— 手动补发
+#   a-share-brief 的直接证据：
+#     10-21  cron 07:20 / 07:45  →  实际 14:10 / 14:35（迟到约 6h50m）
+#     10-22  cron 07:20 / 07:45  →  完全没有触发
 #
-# 任何一个触发成功并把「已完成」标记写入 history.json 后，其余全部在此退出，
-# 不抓数、不部署、不推送，绝不重复打扰。
+#   2026-10-22 用 5 分钟一跑的探针工作流做了对照实验：探针上架 25 分钟，
+#   跨过 5 个应触发点，触发次数为 0。同一天 us-share-brief 的 schedule
+#   三次全部成功——说明调度器没坏，但延迟/丢包是随机的，不可控。
+#
+# 结论：cron 越靠近送达时限，容错空间越小。把 cron 设在收盘前几个小时，
+#       job 一旦被调度起来就先睡到 15:12，让「队列延迟」和「睡眠」互相抵消：
+#
+#   北京 10:00 准点起跑    -> 睡 5h12m     -> 15:12 干活 -> 约 15:15 送达
+#   北京 10:00 延迟 3 小时  -> 13:00 起跑    -> 睡 2h12m     -> 15:12 干活
+#   北京 10:00 延迟 5 小时  -> 15:00 起跑    -> 睡 12 分钟    -> 15:12 干活
+#   北京 10:00 延迟 6 小时  -> 16:00 起跑    -> 不睡，立即干活（迟到但不漏发）
+#
+# 也就是说：只要 job 当天被调度起来，送达时间就被钉死在 15:12 之后几分钟，
+# 不再随 cron 延迟漂移。容错空间从「几分钟」扩大到「半球小时」。
+#
+# 仓库是 public，Actions 分钟数完全免费不限量（私有仓库才有 2000 分钟/月），
+# 每天睡 5 小时不产生任何费用。
+#
+# ---------------------------------------------------------------------------
+# 触发点清单（11 个，分两层 + 2 个手动/外部入口）
+# ---------------------------------------------------------------------------
+#   层    UTC cron          北京时刻     作用
+#   ----  ----------------  -----------  ------------------------------------
+#   锚点  0 2 * * 1-5       10:00        主锚点，睡到 15:12
+#   锚点  0 3 * * 1-5       11:00        备锚点
+#   锚点  0 4 * * 1-5       12:00        备锚点
+#   锚点  0 5 * * 1-5       13:00        备锚点
+#   锚点  0 6 * * 1-5       14:00        备锚点（保底覆盖 1h12m 延迟）
+#   尾点  20 7 * * 1-5      15:20        收盘后直接执行
+#   尾点  50 7 * * 1-5      15:50
+#   尾点  30 8 * * 1-5      16:30
+#   尾点  30 9 * * 1-5      17:30
+#   尾点  30 11 * * 1-5     19:30
+#   兜底  0 13 * * 1-5      21:00        末次兜底，绝不静默漏发
+#
+# 去重靠 data/history.json 的「当日已完成」闸门：第一个跑成功的写标记，
+# 后面的看到标记直接退出（约 10 秒），绝不重复推送。
 # ============================================================================
 
 on:
-  # L1 外部定时器入口。任何能发 HTTP 的服务都可调用：
+  # 外部定时器入口。任何能发 HTTP 的服务都可以叫醒它，作为 cron 的第六重保险：
   #   POST /repos/{owner}/{repo}/dispatches  {"event_type":"daily-brief"}
   repository_dispatch:
     types: [daily-brief]
 
-  # L2 GitHub 原生 cron（UTC，北京时间 = UTC+8）。
-  # 07:15–09:15 每 10 分钟一次（北京 15:15–17:15），共 13 个点；
-  # 再加 3 个夜间兜底。前 13 个里任意一个成功，后面全部走闸门退出。
   schedule:
-    - cron: '15 7 * * 1-5'    # 15:15  ← 首个可用点
-    - cron: '25 7 * * 1-5'    # 15:25
-    - cron: '35 7 * * 1-5'    # 15:35
-    - cron: '45 7 * * 1-5'    # 15:45
-    - cron: '55 7 * * 1-5'    # 15:55
-    - cron: '5 8 * * 1-5'     # 16:05
-    - cron: '15 8 * * 1-5'    # 16:15
-    - cron: '25 8 * * 1-5'    # 16:25
-    - cron: '35 8 * * 1-5'    # 16:35
-    - cron: '45 8 * * 1-5'    # 16:45
-    - cron: '55 8 * * 1-5'    # 16:55
-    - cron: '5 9 * * 1-5'     # 17:05
-    - cron: '15 9 * * 1-5'    # 17:15
-    - cron: '15 10 * * 1-5'   # 18:15  迟到兜底
-    - cron: '30 11 * * 1-5'   # 19:30  迟到兜底
-    - cron: '0 13 * * 1-5'    # 21:00  末次兜底
+    # --- 锚点：收盘前起跑，job 内睡到北京 15:12 ---
+    - cron: '0 2 * * 1-5'     # 10:00  主锚点
+    - cron: '0 3 * * 1-5'     # 11:00
+    - cron: '0 4 * * 1-5'     # 12:00
+    - cron: '0 5 * * 1-5'     # 13:00
+    - cron: '0 6 * * 1-5'     # 14:00
+    # --- 尾点：收盘后直接执行 ---
+    - cron: '20 7 * * 1-5'    # 15:20
+    - cron: '50 7 * * 1-5'    # 15:50
+    - cron: '30 8 * * 1-5'    # 16:30
+    - cron: '30 9 * * 1-5'    # 17:30
+    - cron: '30 11 * * 1-5'   # 19:30
+    # --- 兜底：当天全挂时补发，保证绝不静默 ---
+    - cron: '0 13 * * 1-5'    # 21:00
 
-  # L3 手动补发
   workflow_dispatch:
     inputs:
       force:
         description: '强制重跑（忽略当日已完成检查）'
+        type: boolean
+        default: false
+      dry_run:
+        description: '演练模式（抓数+渲染+部署，但不推送手机、不写已完成标记）'
         type: boolean
         default: false
 
@@ -57,13 +89,18 @@ permissions:
   id-token: write
 
 concurrency:
+  # 串行执行，避免两个 run 同时写 history.json 打架。
+  # 锚点在睡眠期间占锁，后面的触发点排队；锚点结束后第一个 pending 立即执行
+  # 并通过闸门跳过——不会重复推送，也不会漏掉重试机会。
   group: a-share-brief
   cancel-in-progress: false
 
 jobs:
   brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # 锚点最长睡 5h12m，加抓数/部署约 12 分钟。GitHub 单 job 硬上限 6 小时，
+    # 这里留出余量，避免超时被判失败并误发告警。
+    timeout-minutes: 340
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -72,17 +109,23 @@ jobs:
       PAGE_URL: ${{ vars.PAGE_URL || 'https://shinning-niki.github.io/a-share-brief/' }}
 
     steps:
+      # fetch-depth: 0 + 显式 ref：睡眠期间别的 run 可能推送过 commit，
+      # 醒来后要 git pull --rebase 对齐。detached HEAD 下 pull 会直接报错，
+      # 所以这里固定在 main 分支上。
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # ---------------------------------------------------------------- 去重闸门
-      # history.json 含今日日期 = 今天已成功推送。所有触发点里第一个成功后，
-      # 其余全部在这里退出，不会重复抓数、不会重复推送。
+      # ------------------------------------------------------------ 第一道闸门
+      # 放在睡眠之前：如果今天已经推送过（比如手动补跑过），立刻退出，
+      # 不白白占 5 小时睡眠额度。
       - name: 去重闸门（当日是否已完成）
         id: gate
         env:
@@ -99,15 +142,53 @@ jobs:
           if [ "$SKIP" = "true" ]; then
             echo "::notice title=已推送::今日简报已完成，本次触发跳过"
           else
-            echo "::notice title=执行::今日尚未完成，继续抓取与推送"
+            echo "::notice title=执行::今日尚未完成，继续"
           fi
 
-      # ---------------------------------------------------------------- 取数与渲染
+      # ------------------------------------------------------------ 吸收队列延迟
+      # 整套方案的核心：如果现在还没到 15:12，就睡到那时候再干活。
+      # cron 的队列延迟被睡眠吃掉，送达时间恒定在收盘后十几分钟。
+      - name: 候场（睡到北京 15:12，吸收 cron 延迟）
+        id: wait
+        if: steps.gate.outputs.skip != 'true'
+        run: python scripts/wait_for_close.py
+
+      # ------------------------------------------------------------ 第二道闸门
+      # 睡眠期间可能已有其他 run 跑完并推送，醒来必须复查一次，否则重复推送。
+      - name: 醒来复查闸门
+        id: gate2
+        if: steps.gate.outputs.skip != 'true' && steps.wait.outputs.reason != 'too-early'
+        env:
+          FORCE_INPUT: ${{ github.event.inputs.force }}
+        run: |
+          # force 必须同时作用于两道闸门。只作用于第一道时，睡眠醒来会被
+          # 第二道以「今日已完成」拦下，手动强制重跑会永久失效。
+          ARG=""
+          if [ "$FORCE_INPUT" = "true" ]; then
+            ARG="--force"
+          fi
+          OUT=$(python scripts/check_done.py $ARG)
+          echo "$OUT"
+          SKIP=$(echo "$OUT" | grep '^skip=' | cut -d= -f2)
+          echo "skip2=$SKIP" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP" = "true" ]; then
+            echo "::notice title=已被其他触发点完成::本次跳过，不重复推送"
+          fi
+
+      # 睡眠期间代码可能被别的 run 更新过，重新对齐，避免推送时被拒
+      - name: 同步最新代码
+        if: steps.gate.outputs.skip != 'true' && steps.wait.outputs.reason != 'too-early' && steps.gate2.outputs.skip2 != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin main || echo "::warning::代码同步失败，继续执行"
+
+      # ------------------------------------------------------------ 取数与渲染
       # 行情源全挂时 fetch_brief.py 会抛错而不是伪装成「休市」，
       # 保证失败可见、可告警、可在下一个触发点重试。
       - name: 抓取收盘数据
         id: fetch
-        if: steps.gate.outputs.skip != 'true'
+        if: steps.gate.outputs.skip != 'true' && steps.wait.outputs.reason != 'too-early' && steps.gate2.outputs.skip2 != 'true'
         run: |
           python scripts/fetch_brief.py
           TRADING=$(python -c "import json;print(json.load(open('data/brief.json'))['is_trading_day'])")
@@ -121,7 +202,7 @@ jobs:
         if: steps.fetch.outputs.trading == 'True'
         run: python scripts/build_brief.py
 
-      # ---------------------------------------------------------------- 发布页面
+      # ------------------------------------------------------------ 发布页面
       # Pages 是次要目标：三步全部 continue-on-error，任何一步失败都不许
       # 阻塞手机推送。页面失败只影响链接内容，不影响送达。
       - name: 配置 Pages
@@ -144,10 +225,10 @@ jobs:
         continue-on-error: true
         uses: actions/deploy-pages@v4
 
-      # ---------------------------------------------------------------- 主目标：送达
+      # ------------------------------------------------------------ 主目标：送达
       - name: 推送到手机
         id: notify
-        if: steps.fetch.outputs.trading == 'True'
+        if: steps.fetch.outputs.trading == 'True' && github.event.inputs.dry_run != 'true'
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           BARK_URL: ${{ secrets.BARK_URL }}
@@ -161,12 +242,13 @@ jobs:
       # 后续触发点据此跳过；若本步失败，标记不落库，下个触发点自动重试。
       - name: 标记本日已完成
         id: mark
-        if: steps.fetch.outputs.trading == 'True'
+        if: steps.fetch.outputs.trading == 'True' && github.event.inputs.dry_run != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/history.json
-          git diff --quiet --cached || git commit -m "chore: 更新成交额历史 $(date +%Y-%m-%d) [skip ci]"
+          git add data/history.json data/brief.json data/summary.md
+          git diff --quiet --cached || git commit -m "chore: 更新收盘数据 $(date +%Y-%m-%d) [skip ci]"
+          git pull --rebase --autostash origin main || echo "::warning::同步失败"
           git push || echo "::warning::历史文件推送失败，不影响本次简报"
 
       # ---------------------------------------------------------------- 异常告警
@@ -192,6 +274,8 @@ jobs:
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| 触发方式 | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 去重闸门 | skip=${{ steps.gate.outputs.skip }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 候场 | reason=${{ steps.wait.outputs.reason }} waited=${{ steps.wait.outputs.waited }}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| 醒来复查 | skip2=${{ steps.gate2.outputs.skip2 }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 交易日 | ${{ steps.fetch.outputs.trading }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 页面部署 | ${{ steps.deploy.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 手机推送 | ${{ steps.notify.outcome }} |" >> $GITHUB_STEP_SUMMARY
