@@ -1,0 +1,24 @@
+name: cron-probe
+
+# 临时探针：用最高频率（5 分钟）验证 GitHub 定时调度器是否在正常工作。
+# 若探针能被 schedule 触发，说明调度器本身没问题，问题在主工作流配置；
+# 若探针也不触发，说明该账号/仓库的 schedule 通道已失效，必须换外部触发源。
+# 验证完成后本文件会被删除。
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: 记录一次心跳
+        run: |
+          echo "probe ok at $(TZ=Asia/Shanghai date '+%F %T %Z')"
+          echo "event=${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
