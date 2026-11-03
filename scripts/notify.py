@@ -95,17 +95,70 @@ def send_feishu(url, b, page):
 
 
 # --------------------------------------------------------------- Bark
+def build_bark_body(b):
+    """通知正文：先给今天的要闻，再给一行盘面摘要。
+
+    历史教训：旧版取 items[:3]（收盘/结构/量能三段归因），导致
+    1) 每天开头都是同一串指数数字，看起来"没有更新"；
+    2) 180 字硬截断，正文永远停在半句。
+    现在改为「要闻在前、摘要在后」，且只在词边界截断。
+    """
+    idx = b.get("indices") or {}
+    amt = b.get("amount") or {}
+    lines = []
+
+    news = b.get("news") or []
+    for i, n in enumerate(news[:3], 1):
+        t = (n.get("title") if isinstance(n, dict) else str(n)) or ""
+        t = t.strip().rstrip("。")
+        if len(t) > 42:
+            # 优先在标点处断开，避免出现残句
+            cut = max(t.rfind(x, 0, 42) for x in ("，", "；", "：", "、"))
+            t = t[:cut] + "…" if cut >= 18 else t[:42] + "…"
+        if t:
+            lines.append(f"{i}. {t}")
+
+    sh = idx.get("上证指数") or {}
+    tail = []
+    if sh:
+        tail.append(f"上证 {sh.get('close')} {sh.get('pct', 0):+.2f}%")
+    if amt.get("total") is not None:
+        seg = f"成交 {amt['total']} 万亿"
+        if amt.get("delta"):
+            seg += f"({'+' if amt['delta'] > 0 else ''}{amt['delta']:.0f}亿)"
+        tail.append(seg)
+    if tail:
+        lines.append("· " + " ｜ ".join(tail))
+
+    return "\n".join(lines) if lines else b.get("date", "")
+
+
 def send_bark(base, b, page):
-    title = f"A股收盘 · {b.get('date','')}"
-    body = "；".join((it["text"] or "").rstrip("。") for it in (b.get("items") or [])[:3])
-    if len(body) > 180:
-        body = body[:180] + "…"
-    u = (base.rstrip("/") + "/" + urllib.parse.quote(title) + "/"
-         + urllib.parse.quote(body)
-         + "?url=" + urllib.parse.quote(page, safe="")
-         + "&group=" + urllib.parse.quote("A股简报")
-         + "&isArchive=1")
-    return get_url(u)
+    title = f"A股 {b.get('date', '')} 上证{(b.get('indices') or {}).get('上证指数', {}).get('pct', 0):+.2f}%"
+    body = build_bark_body(b)
+
+    base = base.rstrip("/")
+    key = base.rsplit("/", 1)[-1]
+    parts = urllib.parse.urlsplit(base)
+    endpoint = f"{parts.scheme}://{parts.netloc}/push"
+
+    payload = {
+        "device_key": key,
+        "title": title,
+        "body": body,
+        "url": page,
+        "group": "A股简报",
+        "isArchive": 1,
+        "level": "timeSensitive",
+    }
+    try:
+        return post_json(endpoint, payload)
+    except Exception:
+        # 回退到 GET 路径式接口（老版本 Bark Server 只支持这个）
+        u = (base + "/" + urllib.parse.quote(title) + "/" + urllib.parse.quote(body)
+             + "?url=" + urllib.parse.quote(page, safe="")
+             + "&group=" + urllib.parse.quote("A股简报") + "&isArchive=1")
+        return get_url(u)
 
 
 # --------------------------------------------------------------- Server酱
